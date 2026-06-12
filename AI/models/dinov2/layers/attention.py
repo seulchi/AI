@@ -24,6 +24,7 @@ class Attention(nn.Module):
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        rope=None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -35,12 +36,16 @@ class Attention(nn.Module):
         self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.rope = rope
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
         q, k, v = torch.unbind(qkv, 2)
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
+        if self.rope is not None and pos is not None:
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
         x = nn.functional.scaled_dot_product_attention(
             q,
             k,

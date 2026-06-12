@@ -8,7 +8,7 @@
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/patch_embed.py
 
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 from torch import nn, Tensor
@@ -38,6 +38,7 @@ class Block(nn.Module):
         norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
         attn_class: Callable[..., nn.Module] = Attention,
         ffn_layer: Callable[..., nn.Module] = Mlp,
+        rope=None,
     ) -> None:
         super().__init__()
         # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
@@ -49,6 +50,7 @@ class Block(nn.Module):
             proj_bias=proj_bias,
             attn_drop=attn_drop,
             proj_drop=drop,
+            rope=rope,
         )
         self.ls1 = (
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -71,9 +73,9 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor) -> Tensor:
-        def attn_residual_func(x: Tensor) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x)))
+    def forward(self, x: Tensor, pos=None) -> Tensor:
+        def attn_residual_func(x: Tensor, pos=None) -> Tensor:
+            return self.ls1(self.attn(self.norm1(x), pos=pos))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
@@ -84,6 +86,7 @@ class Block(nn.Module):
                 x,
                 residual_func=attn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
+                pos=pos,
             )
             x = drop_add_residual_stochastic_depth(
                 x,
@@ -91,10 +94,10 @@ class Block(nn.Module):
                 sample_drop_ratio=self.sample_drop_ratio,
             )
         elif self.training and self.sample_drop_ratio > 0.0:
-            x = x + self.drop_path1(attn_residual_func(x))
+            x = x + self.drop_path1(attn_residual_func(x, pos=pos))
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x)
+            x = x + attn_residual_func(x, pos=pos)
             x = x + ffn_residual_func(x)
         return x
 
@@ -103,6 +106,7 @@ def drop_add_residual_stochastic_depth(
     x: Tensor,
     residual_func: Callable[[Tensor], Tensor],
     sample_drop_ratio: float = 0.0,
+    pos: Optional[Tensor] = None,
 ) -> Tensor:
     # 1) extract subset using permutation
     b, n, d = x.shape
@@ -111,7 +115,11 @@ def drop_add_residual_stochastic_depth(
     x_subset = x[brange]
 
     # 2) apply residual_func to get residual
-    residual = residual_func(x_subset)
+    if pos is not None:
+        pos = pos[brange]
+        residual = residual_func(x_subset, pos=pos)
+    else:
+        residual = residual_func(x_subset)
 
     x_flat = x.flatten(1)
     residual = residual.flatten(1)
