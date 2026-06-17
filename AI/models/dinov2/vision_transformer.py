@@ -22,6 +22,8 @@ from .layers import (
     PatchEmbed,
     SwiGLUFFNFused,
     Block,
+    PositionGetter,
+    RotaryPositionEmbedding2D,
 )
 
 logger = logging.getLogger("dinov2")
@@ -50,6 +52,8 @@ class DinoVisionTransformer(nn.Module):
         num_register_tokens=0,
         interpolate_antialias=False,
         interpolate_offset=0.1,
+        rope_start=-1,
+        rope_freq=100,
     ):
         """
         Args:
@@ -76,6 +80,7 @@ class DinoVisionTransformer(nn.Module):
             interpolate_offset: (float) work-around offset to apply when interpolating positional embeddings
         """
         super().__init__()
+        self.patch_start_idx = 1 + num_register_tokens
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
         self.num_features = self.embed_dim = (
@@ -88,6 +93,7 @@ class DinoVisionTransformer(nn.Module):
         self.num_register_tokens = num_register_tokens
         self.interpolate_antialias = interpolate_antialias
         self.interpolate_offset = interpolate_offset
+        self.rope_start = rope_start
 
         self.patch_embed = embed_layer(
             img_size=img_size,
@@ -131,6 +137,16 @@ class DinoVisionTransformer(nn.Module):
         else:
             raise NotImplementedError
 
+        if self.rope_start != -1:
+            self.rope = (
+                RotaryPositionEmbedding2D(frequency=rope_freq)
+                if rope_freq > 0
+                else None
+            )
+            self.position_getter = PositionGetter() if self.rope is not None else None
+        else:
+            self.rope = None
+
         blocks_list = [
             block_fn(
                 dim=embed_dim,
@@ -144,6 +160,7 @@ class DinoVisionTransformer(nn.Module):
                 act_layer=act_layer,
                 ffn_layer=ffn_layer,
                 init_values=init_values,
+                rope=self.rope if i >= rope_start and rope_start != -1 else None,
             )
             for i in range(depth)
         ]
@@ -186,6 +203,20 @@ class DinoVisionTransformer(nn.Module):
             previous_dtype
         )
 
+    def _prepare_rope(self, B: int, H: int, W: int, device: torch.device):
+        pos = None
+        if self.rope is not None:
+            pos = self.position_getter(
+                B, H // self.patch_size, W // self.patch_size, device=device
+            )
+            if self.patch_start_idx > 0:
+                pos = pos + 1
+                pos_special = torch.zeros(
+                    B, self.patch_start_idx, 2, device=device, dtype=pos.dtype
+                )
+                pos = torch.cat([pos_special, pos], dim=1)
+        return pos
+
     def prepare_tokens(self, x):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)
@@ -205,18 +236,20 @@ class DinoVisionTransformer(nn.Module):
         return x
 
     def _get_intermediate_layers_not_chunked(self, x, n=1):
+        B, _, H, W = x.shape
         x = self.prepare_tokens(x)
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = (
             range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         )
+        pos = self._prepare_rope(B, H, W, x.device)
         use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training
         for i, blk in enumerate(self.blocks):
             if use_ckpt:
-                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(blk, x, pos, use_reentrant=False)
             else:
-                x = blk(x)
+                x = blk(x, pos)
             if i in blocks_to_take:
                 output.append(x)
         assert len(output) == len(
@@ -315,7 +348,7 @@ def vit_giant2(patch_size=16, num_register_tokens=0, in_chans=3, **kwargs):
     return model
 
 
-def DINOv2(model_name):
+def DINOv2(model_name, **kwargs):
     model_zoo = {
         "vits": vit_small,
         "vitb": vit_base,
@@ -331,4 +364,5 @@ def DINOv2(model_name):
         num_register_tokens=0,
         interpolate_antialias=False,
         interpolate_offset=0.1,
+        **kwargs,
     )
