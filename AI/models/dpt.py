@@ -12,7 +12,7 @@ class DPT(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        output_dim: int = 768,
+        output_dim: int = 4,
         patch_size: int = 14,
         features: int = 256,
         out_channels: Sequence[int] = (256, 512, 1024, 1024),
@@ -86,8 +86,9 @@ class DPT(nn.Module):
                 padding=1,
             ),
             nn.ReLU(True),
-            nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(True),
+            nn.Conv2d(
+                head_features_2, self.out_dim, kernel_size=1, stride=1, padding=0
+            ),
         )
 
     def forward(
@@ -95,7 +96,7 @@ class DPT(nn.Module):
         features: List[Tuple[torch.Tensor, torch.Tensor]],
         H: int,
         W: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
         out = []
@@ -111,7 +112,11 @@ class DPT(nn.Module):
         x = self.scratch.output_conv(out)
         x = nn.functional.interpolate(x, (H, W), mode="bilinear", align_corners=True)
         x = self.scratch.output_conv2(x)
-        return x
+
+        ray_directions, ray_depths = torch.split(x, [3, 1], dim=1)
+        ray_directions = nn.functional.normalize(ray_directions, dim=1)
+        ray_depths = torch.exp(ray_depths)
+        return ray_directions, ray_depths
 
     def _fuse(self, feats: List[torch.Tensor]) -> torch.Tensor:
         l1 = self.scratch.layer1_rn(feats[0])
