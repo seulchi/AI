@@ -1,4 +1,4 @@
-from typing import Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,9 +13,12 @@ class ModelNet(nn.Module):
     - Backbone: DinoV2 feature extractor
     - Head: DPT for factored ray prediction
 
+    Args:
+        views (List[torch.Tensor]): List of input views' images. (B, 3, H, W)
+
     Returns:
-        ray_directions: per-pixel unit vectors (B, 3, H, W)
-        ray_depths: Euclidean distance from camera center (B, 1, H, W)
+        ray_directions (Tuple[torch.Tensor, ...]): Ray directions in the local camera frame. (B, 3, H, W)
+        ray_depths (Tuple[torch.Tensor, ...]): Depth along the ray. (B, 1, H, W)
     """
 
     PATCH_SIZE = 14
@@ -39,8 +42,11 @@ class ModelNet(nn.Module):
             out_channels=dpt_out_channels,
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x: (B, 3, H, W)
+    def forward(
+        self, views: List[torch.Tensor]
+    ) -> Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        num_views = len(views)
+        x = torch.cat(views, dim=0)  # (N*B, 3, H, W)
         _, _, H, W = x.shape
         features = self.backbone.get_intermediate_layers(
             x,
@@ -52,4 +58,6 @@ class ModelNet(nn.Module):
         # features: [(patch_tokens, cls_token), ...]
 
         ray_directions, ray_depths = self.dpt(features, H, W)
+        ray_directions = torch.chunk(ray_directions, num_views, dim=0)
+        ray_depths = torch.chunk(ray_depths, num_views, dim=0)
         return ray_directions, ray_depths
