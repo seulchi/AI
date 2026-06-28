@@ -98,11 +98,12 @@ class DPT(nn.Module):
         W: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
+        B, S, N, C = features[0][0].shape
+        features = [feat[0].reshape(B * S, N, C) for feat in features]
 
         out = []
-        for i, (patch, _cls) in enumerate(features):
-            B, _, C = patch.shape
-            x = patch.permute(0, 2, 1).contiguous().reshape(B, C, patch_h, patch_w)
+        for i, patch in enumerate(features):
+            x = patch.permute(0, 2, 1).contiguous().reshape(B * S, C, patch_h, patch_w)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             out.append(x)

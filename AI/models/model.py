@@ -10,15 +10,8 @@ from .dpt import DPT
 class ModelNet(nn.Module):
     """
     Architecture:
-    - Backbone: DinoV2 feature extractor
+    - Backbone: DinoV2 feature extractor with alternating attention
     - Head: DPT for factored ray prediction
-
-    Args:
-        views (List[torch.Tensor]): List of input views' images. (B, 3, H, W)
-
-    Returns:
-        ray_directions (Tuple[torch.Tensor, ...]): Ray directions in the local camera frame. (B, 3, H, W)
-        ray_depths (Tuple[torch.Tensor, ...]): Depth along the ray. (B, 1, H, W)
     """
 
     PATCH_SIZE = 14
@@ -26,7 +19,7 @@ class ModelNet(nn.Module):
     def __init__(
         self,
         backbone: nn.Module,
-        intermediate_layer_idx: Sequence[int],
+        intermediate_layer_idx: Sequence[int] = (11, 15, 19, 23),
         dpt_features: int = 256,
         dpt_out_channels: Sequence[int] = (256, 512, 1024, 1024),
         dpt_output_dim: int = 4,
@@ -35,29 +28,38 @@ class ModelNet(nn.Module):
         self.backbone = backbone
         self.intermediate_layer_idx = list(intermediate_layer_idx)
         self.dpt = DPT(
-            in_channels=backbone.embed_dim,
+            in_channels=backbone.embed_dim * 2,
             output_dim=dpt_output_dim,
             patch_size=self.PATCH_SIZE,
             features=dpt_features,
             out_channels=dpt_out_channels,
         )
 
-    def forward(
-        self, views: List[torch.Tensor]
-    ) -> Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
-        num_views = len(views)
-        x = torch.cat(views, dim=0)  # (N*B, 3, H, W)
-        _, _, H, W = x.shape
+    def forward(self, views: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            views (List[torch.Tensor]): List of input views' images. (B, 3, H, W)
+
+        Returns:
+            ray_directions (torch.Tensor): Ray directions in the local camera frame. (B, S, 3, H, W)
+            ray_depths (torch.Tensor): Depth along the ray. (B, S, 1, H, W)
+
+        """
+
+        num_of_views = len(views)
+        B, _, H, W = views[0].shape
+        x = torch.stack(views, dim=1)
+
         features = self.backbone.get_intermediate_layers(
             x,
             n=self.intermediate_layer_idx,
-            reshape=False,
-            return_class_token=True,
             norm=True,
         )
-        # features: [(patch_tokens, cls_token), ...]
+        # features: [(feature (B, S, P, 2C), camera_token (B, S, 2C)), ...]
 
         ray_directions, ray_depths = self.dpt(features, H, W)
-        ray_directions = torch.chunk(ray_directions, num_views, dim=0)
-        ray_depths = torch.chunk(ray_depths, num_views, dim=0)
+
+        ray_directions = ray_directions.unflatten(0, (B, num_of_views))
+        ray_depths = ray_depths.unflatten(0, (B, num_of_views))
+
         return ray_directions, ray_depths

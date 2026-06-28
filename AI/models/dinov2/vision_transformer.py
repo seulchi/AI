@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
+from einops import rearrange
 
 from .layers import (
     Mlp,
@@ -52,6 +53,7 @@ class DinoVisionTransformer(nn.Module):
         num_register_tokens=0,
         interpolate_antialias=False,
         interpolate_offset=0.1,
+        alt_start=1,
         rope_start=-1,
         rope_freq=100,
     ):
@@ -93,6 +95,7 @@ class DinoVisionTransformer(nn.Module):
         self.num_register_tokens = num_register_tokens
         self.interpolate_antialias = interpolate_antialias
         self.interpolate_offset = interpolate_offset
+        self.alt_start = alt_start
         self.rope_start = rope_start
 
         self.patch_embed = embed_layer(
@@ -104,6 +107,8 @@ class DinoVisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        if alt_start != -1:
+            self.camera_token = nn.Parameter(torch.zeros(1, 2, embed_dim))
         self.pos_embed = nn.Parameter(
             torch.zeros(1, num_patches + self.num_tokens, embed_dim)
         )
@@ -203,22 +208,14 @@ class DinoVisionTransformer(nn.Module):
             previous_dtype
         )
 
-    def _prepare_rope(self, B: int, H: int, W: int, device: torch.device):
-        pos = None
-        if self.rope is not None:
-            pos = self.position_getter(
-                B, H // self.patch_size, W // self.patch_size, device=device
-            )
-            if self.patch_start_idx > 0:
-                pos = pos + 1
-                pos_special = torch.zeros(
-                    B, self.patch_start_idx, 2, device=device, dtype=pos.dtype
-                )
-                pos = torch.cat([pos_special, pos], dim=1)
-        return pos
+    def prepare_cls_token(self, B, S):
+        cls_token = self.cls_token.expand(B, S, -1)
+        cls_token = cls_token.reshape(B * S, -1, self.embed_dim)
+        return cls_token
 
     def prepare_tokens(self, x):
-        B, nc, w, h = x.shape
+        B, S, nc, w, h = x.shape
+        x = rearrange(x, "b s c h w -> (b s) c h w")
         x = self.patch_embed(x)
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = x + self.interpolate_pos_encoding(x, w, h)
@@ -232,57 +229,117 @@ class DinoVisionTransformer(nn.Module):
                 ),
                 dim=1,
             )
-
+        x = rearrange(x, "(b s) n c -> b s n c", b=B, s=S)
         return x
 
+    def _prepare_rope(self, B, S, H, W, device):
+        pos = None
+        pos_nodiff = None
+        if self.rope is not None:
+            pos = self.position_getter(
+                B * S, H // self.patch_size, W // self.patch_size, device=device
+            )
+            pos = rearrange(pos, "(b s) n c -> b s n c", b=B)
+            pos_nodiff = torch.zeros_like(pos).to(pos.dtype)
+            if self.patch_start_idx > 0:
+                pos = pos + 1
+                pos_special = (
+                    torch.zeros(B * S, self.patch_start_idx, 2).to(device).to(pos.dtype)
+                )
+                pos_special = rearrange(pos_special, "(b s) n c -> b s n c", b=B)
+                pos = torch.cat([pos_special, pos], dim=2)
+                pos_nodiff = pos_nodiff + 1
+                pos_nodiff = torch.cat([pos_special, pos_nodiff], dim=2)
+        return pos, pos_nodiff
+
     def _get_intermediate_layers_not_chunked(self, x, n=1):
-        B, _, H, W = x.shape
+        B, S, _, H, W = x.shape
         x = self.prepare_tokens(x)
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = (
             range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         )
-        pos = self._prepare_rope(B, H, W, x.device)
-        use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training
+        pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
         for i, blk in enumerate(self.blocks):
-            if use_ckpt:
-                x = torch.utils.checkpoint.checkpoint(blk, x, pos, use_reentrant=False)
+            if i < self.rope_start or self.rope is None:
+                g_pos, l_pos = None, None
             else:
-                x = blk(x, pos)
+                g_pos = pos_nodiff
+                l_pos = pos
+            if self.alt_start != -1 and i == self.alt_start:
+                ref_token = self.camera_token[:, :1].expand(B, -1, -1)
+                src_token = self.camera_token[:, 1:].expand(B, S - 1, -1)
+                cam_token = torch.cat([ref_token, src_token], dim=1)
+                x[:, :, 0] = cam_token
+
+            if self.alt_start != -1 and i >= self.alt_start and i % 2 == 1:
+                x = self.process_attention(x, blk, "global", pos=g_pos)
+            else:
+                x = self.process_attention(x, blk, "local", pos=l_pos)
+                local_x = x
+
             if i in blocks_to_take:
-                output.append(x)
+                out_x = torch.cat([local_x, x], dim=-1)
+                output.append((out_x[:, :, 0], out_x))
         assert len(output) == len(
             blocks_to_take
         ), f"only {len(output)} / {len(blocks_to_take)} blocks found"
         return output
 
+    def process_attention(self, x, block, attn_type="global", pos=None):
+        b, s, n = x.shape[:3]
+        if attn_type == "local":
+            x = rearrange(x, "b s n c -> (b s) n c")
+            if pos is not None:
+                pos = rearrange(pos, "b s n c -> (b s) n c")
+        elif attn_type == "global":
+            x = rearrange(x, "b s n c -> b (s n) c")
+            if pos is not None:
+                pos = rearrange(pos, "b s n c -> b (s n) c")
+        else:
+            raise ValueError(f"Invalid attention type: {attn_type}")
+
+        if getattr(self, "gradient_checkpointing", False) and self.training:
+            x = torch.utils.checkpoint.checkpoint(block, x, pos, use_reentrant=False)
+        else:
+            x = block(x, pos=pos)
+
+        if attn_type == "local":
+            x = rearrange(x, "(b s) n c -> b s n c", b=b, s=s)
+        elif attn_type == "global":
+            x = rearrange(x, "b (s n) c -> b s n c", b=b, s=s)
+        return x
+
     def get_intermediate_layers(
         self,
         x: torch.Tensor,
         n: Union[int, Sequence] = 1,  # Layers or n last layers to take
-        reshape: bool = False,
-        return_class_token: bool = False,
         norm=True,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
 
         outputs = self._get_intermediate_layers_not_chunked(x, n)
+        camera_tokens = [out[0] for out in outputs]
         if norm:
-            outputs = [self.norm(out) for out in outputs]
-        class_tokens = [out[:, 0] for out in outputs]
-        outputs = [out[:, 1 + self.num_register_tokens :] for out in outputs]
-        if reshape:
-            B, _, w, h = x.shape
-            outputs = [
-                out.reshape(B, w // self.patch_size, h // self.patch_size, -1)
-                .permute(0, 3, 1, 2)
-                .contiguous()
-                for out in outputs
-            ]
-
-        if return_class_token:
-            return tuple(zip(outputs, class_tokens))
-        return tuple(outputs)
+            if outputs[0][1].shape[-1] == self.embed_dim:
+                outputs = [self.norm(out[1]) for out in outputs]
+            elif outputs[0][1].shape[-1] == self.embed_dim * 2:
+                outputs = [
+                    torch.cat(
+                        [
+                            out[1][..., : self.embed_dim],
+                            self.norm(out[1][..., self.embed_dim :]),
+                        ],
+                        dim=-1,
+                    )
+                    for out in outputs
+                ]
+            else:
+                raise ValueError(f"Invalid output shape: {outputs[0][1].shape}")
+        else:
+            outputs = [out[1] for out in outputs]
+        outputs = [out[..., 1 + self.num_register_tokens :, :] for out in outputs]
+        return tuple(zip(outputs, camera_tokens))
 
 
 def vit_small(patch_size=16, num_register_tokens=0, in_chans=3, **kwargs):
